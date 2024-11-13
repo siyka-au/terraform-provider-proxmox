@@ -9,10 +9,13 @@ package resource
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"net/url"
@@ -26,6 +29,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"golang.org/x/crypto/blake2b"
 	"golang.org/x/exp/slices"
 
 	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
@@ -35,14 +39,20 @@ import (
 )
 
 const (
-	dvResourceVirtualEnvironmentFileSourceFileChanged  = false
-	dvResourceVirtualEnvironmentFileSourceFileChecksum = ""
-	dvResourceVirtualEnvironmentFileSourceFileFileName = ""
-	dvResourceVirtualEnvironmentFileSourceFileInsecure = false
-	dvResourceVirtualEnvironmentFileSourceFileMinTLS   = ""
-	dvResourceVirtualEnvironmentFileOverwrite          = true
-	dvResourceVirtualEnvironmentFileSourceRawResize    = 0
-	dvResourceVirtualEnvironmentFileTimeoutUpload      = 1800
+	dvResourceVirtualEnvironmentFileSourceFileChanged   = false
+	dvResourceVirtualEnvironmentFileSourceFileChecksum  = ""
+	dvResourceVirtualEnvironmentFileSourceFileMd5Sum    = ""
+	dvResourceVirtualEnvironmentFileSourceFileSha224Sum = ""
+	dvResourceVirtualEnvironmentFileSourceFileSha256Sum = ""
+	dvResourceVirtualEnvironmentFileSourceFileSha384Sum = ""
+	dvResourceVirtualEnvironmentFileSourceFileSha512Sum = ""
+	dvResourceVirtualEnvironmentFileSourceFileBlake2Sum = ""
+	dvResourceVirtualEnvironmentFileSourceFileFileName  = ""
+	dvResourceVirtualEnvironmentFileSourceFileInsecure  = false
+	dvResourceVirtualEnvironmentFileSourceFileMinTLS    = ""
+	dvResourceVirtualEnvironmentFileOverwrite           = true
+	dvResourceVirtualEnvironmentFileSourceRawResize     = 0
+	dvResourceVirtualEnvironmentFileTimeoutUpload       = 1800
 
 	mkResourceVirtualEnvironmentFileContentType          = "content_type"
 	mkResourceVirtualEnvironmentFileDatastoreID          = "datastore_id"
@@ -57,6 +67,12 @@ const (
 	mkResourceVirtualEnvironmentFileSourceFilePath       = "path"
 	mkResourceVirtualEnvironmentFileSourceFileChanged    = "changed"
 	mkResourceVirtualEnvironmentFileSourceFileChecksum   = "checksum"
+	mkResourceVirtualEnvironmentFileSourceFileMd5Sum     = "md5sum"
+	mkResourceVirtualEnvironmentFileSourceFileSha224Sum  = "sha224sum"
+	mkResourceVirtualEnvironmentFileSourceFileSha256Sum  = "sha256sum"
+	mkResourceVirtualEnvironmentFileSourceFileSha384Sum  = "sha384sum"
+	mkResourceVirtualEnvironmentFileSourceFileSha512Sum  = "sha512sum"
+	mkResourceVirtualEnvironmentFileSourceFileBlake2Sum  = "b2sum"
 	mkResourceVirtualEnvironmentFileSourceFileFileName   = "file_name"
 	mkResourceVirtualEnvironmentFileSourceFileInsecure   = "insecure"
 	mkResourceVirtualEnvironmentFileSourceFileMinTLS     = "min_tls"
@@ -152,6 +168,48 @@ func File() *schema.Resource {
 							Optional:    true,
 							ForceNew:    true,
 							Default:     dvResourceVirtualEnvironmentFileSourceFileChecksum,
+						},
+						mkResourceVirtualEnvironmentFileSourceFileMd5Sum: {
+							Type:        schema.TypeString,
+							Description: "The MD5 checksum of the source file",
+							Optional:    true,
+							ForceNew:    true,
+							Default:     dvResourceVirtualEnvironmentFileSourceFileMd5Sum,
+						},
+						mkResourceVirtualEnvironmentFileSourceFileSha224Sum: {
+							Type:        schema.TypeString,
+							Description: "The SHA224 checksum of the source file",
+							Optional:    true,
+							ForceNew:    true,
+							Default:     dvResourceVirtualEnvironmentFileSourceFileSha224Sum,
+						},
+						mkResourceVirtualEnvironmentFileSourceFileSha256Sum: {
+							Type:        schema.TypeString,
+							Description: "The SHA256 checksum of the source file",
+							Optional:    true,
+							ForceNew:    true,
+							Default:     dvResourceVirtualEnvironmentFileSourceFileSha256Sum,
+						},
+						mkResourceVirtualEnvironmentFileSourceFileSha384Sum: {
+							Type:        schema.TypeString,
+							Description: "The SHA384 checksum of the source file",
+							Optional:    true,
+							ForceNew:    true,
+							Default:     dvResourceVirtualEnvironmentFileSourceFileSha384Sum,
+						},
+						mkResourceVirtualEnvironmentFileSourceFileSha512Sum: {
+							Type:        schema.TypeString,
+							Description: "The SHA512 checksum of the source file",
+							Optional:    true,
+							ForceNew:    true,
+							Default:     dvResourceVirtualEnvironmentFileSourceFileSha512Sum,
+						},
+						mkResourceVirtualEnvironmentFileSourceFileBlake2Sum: {
+							Type:        schema.TypeString,
+							Description: "The Blake2 checksum of the source file",
+							Optional:    true,
+							ForceNew:    true,
+							Default:     dvResourceVirtualEnvironmentFileSourceFileBlake2Sum,
 						},
 						mkResourceVirtualEnvironmentFileSourceFileFileName: {
 							Type:        schema.TypeString,
@@ -398,6 +456,12 @@ func fileCreate(ctx context.Context, d *schema.ResourceData, m interface{}) diag
 		sourceFileBlock := sourceFile[0].(map[string]interface{})
 		sourceFilePath := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFilePath].(string)
 		sourceFileChecksum := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFileChecksum].(string)
+		sourceFileMd5Sum := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFileMd5Sum].(string)
+		sourceFileSha224Sum := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFileSha224Sum].(string)
+		sourceFileSha256Sum := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFileSha256Sum].(string)
+		sourceFileSha384Sum := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFileSha384Sum].(string)
+		sourceFileSha512Sum := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFileSha512Sum].(string)
+		sourceFileBlake2Sum := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFileBlake2Sum].(string)
 		sourceFileMinTLS := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFileMinTLS].(string)
 		sourceFileInsecure := sourceFileBlock[mkResourceVirtualEnvironmentFileSourceFileInsecure].(bool)
 
@@ -457,15 +521,51 @@ func fileCreate(ctx context.Context, d *schema.ResourceData, m interface{}) diag
 			sourceFilePathLocal = sourceFilePath
 		}
 
+		type ChecksumEntry struct {
+			name     string
+			hash     hash.Hash
+			expected string
+		}
+
+		var checksummers []ChecksumEntry
+
 		// Calculate the checksum of the source file now that it's available locally.
-		if sourceFileChecksum != "" {
+		if sourceFileSha256Sum == "" && sourceFileChecksum != "" {
+			sourceFileSha256Sum = sourceFileChecksum
+		}
+
+		if sourceFileMd5Sum != "" {
+			checksummers = append(checksummers, ChecksumEntry{"MD5", md5.New(), sourceFileMd5Sum})
+		}
+
+		if sourceFileSha224Sum != "" {
+			checksummers = append(checksummers, ChecksumEntry{"SHA224", sha256.New224(), sourceFileSha224Sum})
+		}
+
+		if sourceFileSha256Sum != "" {
+			checksummers = append(checksummers, ChecksumEntry{"SHA256", sha256.New(), sourceFileSha256Sum})
+		}
+
+		if sourceFileSha384Sum != "" {
+			checksummers = append(checksummers, ChecksumEntry{"SHA384", sha512.New384(), sourceFileSha384Sum})
+		}
+
+		if sourceFileSha512Sum != "" {
+			checksummers = append(checksummers, ChecksumEntry{"SHA512", sha512.New(), sourceFileSha512Sum})
+		}
+
+		if sourceFileBlake2Sum != "" {
+			h, _ := blake2b.New512([]byte{})
+			checksummers = append(checksummers, ChecksumEntry{"BLAKE2-512", h, sourceFileBlake2Sum})
+		}
+
+		for _, checksummer := range checksummers {
 			file, err := os.Open(sourceFilePathLocal)
 			if err != nil {
 				return diag.FromErr(err)
 			}
 
-			h := sha256.New()
-			_, err = io.Copy(h, file)
+			_, err = io.Copy(checksummer.hash, file)
 			diags = append(diags, diag.FromErr(err)...)
 			err = file.Close()
 			diags = append(diags, diag.FromErr(err)...)
@@ -473,17 +573,17 @@ func fileCreate(ctx context.Context, d *schema.ResourceData, m interface{}) diag
 				return diags
 			}
 
-			calculatedChecksum := fmt.Sprintf("%x", h.Sum(nil))
+			calculatedChecksum := fmt.Sprintf("%x", checksummer.hash.Sum(nil))
 			tflog.Debug(ctx, "Calculated checksum", map[string]interface{}{
-				"source": sourceFilePath,
-				"sha256": calculatedChecksum,
+				"source":         sourceFilePath,
+				checksummer.name: calculatedChecksum,
 			})
 
-			if sourceFileChecksum != calculatedChecksum {
+			if checksummer.expected != calculatedChecksum {
 				return diag.Errorf(
 					"the calculated SHA256 checksum \"%s\" does not match source checksum \"%s\"",
 					calculatedChecksum,
-					sourceFileChecksum,
+					sourceFileSha256Sum,
 				)
 			}
 		}
