@@ -581,9 +581,10 @@ func fileCreate(ctx context.Context, d *schema.ResourceData, m interface{}) diag
 
 			if checksummer.expected != calculatedChecksum {
 				return diag.Errorf(
-					"the calculated SHA256 checksum \"%s\" does not match source checksum \"%s\"",
+					"the calculated %s checksum \"%s\" does not match source checksum \"%s\"",
+					checksummer.name,
 					calculatedChecksum,
-					sourceFileSha256Sum,
+					checksummer.expected,
 				)
 			}
 		}
